@@ -1,10 +1,12 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Dict, Any
+from pydantic import BaseModel, EmailStr
+from typing import Dict, Any, List, Optional
+from datetime import datetime
 
-from schemas import ALL_SCHEMAS
+from schemas import ALL_SCHEMAS, Master, Client, Booking
+from database import create_document, get_documents
 
 app = FastAPI(title="BeautyConnect API")
 
@@ -29,7 +31,6 @@ def get_schema():
     """Expose declared Pydantic models so DB viewer can use them."""
     out: Dict[str, Dict[str, Any]] = {}
     for name, model in ALL_SCHEMAS.items():
-        # Pydantic v2 model_json_schema
         out[name] = model.model_json_schema()
     return out
 
@@ -62,6 +63,113 @@ def test_database():
     except Exception as e:
         response["database"] = f"❌ Error: {str(e)[:80]}"
     return response
+
+# ---------------------
+# Masters API
+# ---------------------
+
+class MasterOut(BaseModel):
+    id: str
+    name: str
+    role: Optional[str] = None
+    rating: float = 0
+    reviews_count: int = 0
+    city: Optional[str] = None
+    avatar: Optional[str] = None
+    verified: bool = False
+
+
+def _serialize_master(doc: dict) -> MasterOut:
+    return MasterOut(
+        id=str(doc.get("_id")),
+        name=doc.get("name", ""),
+        role=(doc.get("skills") or [None])[0],
+        rating=float(doc.get("rating", 0)),
+        reviews_count=int(doc.get("reviews_count", 0)),
+        city=doc.get("city"),
+        avatar=doc.get("avatar"),
+        verified=bool(doc.get("verified", False)),
+    )
+
+@app.get("/api/masters", response_model=List[MasterOut])
+def list_masters(city: Optional[str] = Query(default=None, description="Filter by city"), limit: int = Query(default=12, ge=1, le=100)):
+    filter_q = {}
+    if city:
+        filter_q["city"] = city
+    try:
+        docs = get_documents("master", filter_q, limit=limit)
+        return [_serialize_master(d) for d in docs]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/masters", status_code=201)
+def create_master(master: Master):
+    try:
+        new_id = create_document("master", master)
+        return {"id": new_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Simple seed endpoint for demo purposes
+@app.post("/api/seed", tags=["dev"])
+def seed_demo_data():
+    sample = [
+        Master(name="Анна Петрова", city="Москва", skills=["Визажист"], rating=4.9, reviews_count=182, avatar="https://images.unsplash.com/photo-1527980965255-d3b416303d12?q=80&w=300&auto=format&fit=crop"),
+        Master(name="Ирина Смирнова", city="Санкт-Петербург", skills=["Мастер маникюра"], rating=4.8, reviews_count=240, avatar="https://images.unsplash.com/photo-1544005313-94ddf0286df2?q=80&w=300&auto=format&fit=crop"),
+        Master(name="Мария Иванова", city="Казань", skills=["Парикмахер-стилист"], rating=5.0, reviews_count=320, avatar="https://images.unsplash.com/photo-1502685104226-ee32379fefbe?q=80&w=300&auto=format&fit=crop"),
+    ]
+    try:
+        ids = [create_document("master", m) for m in sample]
+        return {"inserted": len(ids), "ids": ids}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------
+# Booking API
+# ---------------------
+
+class BookingRequest(BaseModel):
+    master_id: str
+    name: str
+    email: EmailStr
+    datetime_utc: datetime
+    notes: Optional[str] = None
+
+class BookingOut(BaseModel):
+    id: str
+    status: str
+
+@app.post("/api/bookings", response_model=BookingOut, status_code=201)
+def create_booking(req: BookingRequest):
+    try:
+        # Create client first
+        client = Client(name=req.name, email=req.email)
+        client_id = create_document("client", client)
+        # Create booking (service unknown at this stage)
+        booking = Booking(
+            master_id=req.master_id,
+            client_id=client_id,
+            service_id="unknown",
+            datetime_utc=req.datetime_utc,
+            status="pending",
+            notes=req.notes,
+        )
+        booking_id = create_document("booking", booking)
+        return BookingOut(id=booking_id, status="pending")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/bookings")
+def list_bookings(master_id: Optional[str] = None, limit: int = Query(default=50, ge=1, le=200)):
+    try:
+        q = {"master_id": master_id} if master_id else {}
+        docs = get_documents("booking", q, limit=limit)
+        # sanitize ids
+        for d in docs:
+            d["id"] = str(d.pop("_id", ""))
+        return docs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
